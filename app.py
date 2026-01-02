@@ -6,7 +6,6 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- Configuration ---
@@ -15,9 +14,7 @@ VECTORSTORE_PATH = "faiss_index"
 TOP_K_RETRIEVAL = 5
 TOP_N_RERANK = 1
 
-# === THE FIX IS HERE ===
-# We are going back to the structured ChatPromptTemplate, which is the correct
-# way to interact with a "Chat" model like ChatGroq.
+# --- Prompt Definition ---
 system_prompt = """You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT provided.
 - Do not use any external knowledge or make assumptions.
 - If the CONTEXT contains a list that answers the question, reproduce that list exactly.
@@ -67,14 +64,10 @@ def main():
         st.error(f"Failed to load resources: {e}")
         return
 
-    # === AND THE FIX IS HERE ===
-    # We construct the ChatPromptTemplate from our system and human prompts.
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("human", human_prompt),
     ])
-    
-    rag_chain = prompt | llm | StrOutputParser()
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -90,21 +83,35 @@ def main():
 
         with st.chat_message("assistant"):
             with st.spinner("Searching document and generating answer..."):
+                # === THE FIX IS HERE: We manually perform the RAG steps ===
+                
+                # 1. Retrieve initial documents
                 initial_docs = retriever.invoke(user_question)
                 if not initial_docs:
                     st.write("I couldn't find any relevant information.")
                     st.session_state.messages.append({"role": "assistant", "content": "I couldn't find any relevant information."})
-                    st.stop()
+                    return # Use return instead of st.stop()
 
+                # 2. Rerank the documents to find the best one
                 query_doc_pairs = [[user_question, doc.page_content] for doc in initial_docs]
                 scores = reranker_model.score(query_doc_pairs)
                 reranked_results = sorted(zip(scores, initial_docs), key=lambda x: x[0], reverse=True)
-                
                 final_doc = reranked_results[0][1]
                 context_text = final_doc.page_content
 
-                response = rag_chain.stream({"context": context_text, "question": user_question})
-                generative_answer = st.write_stream(response)
+                # 3. Format the prompt with the context
+                messages = prompt.format_messages(context=context_text, question=user_question)
+
+                # 4. Call the LLM directly with the formatted messages
+                response_stream = llm.stream(messages)
+
+                # 5. Define a generator to extract content from the stream
+                def stream_to_content(stream):
+                    for chunk in stream:
+                        yield chunk.content
+
+                # 6. Write the final response to the screen
+                generative_answer = st.write_stream(stream_to_content(response_stream))
                 
                 with st.expander("Show Source Used"):
                     st.write(context_text)
