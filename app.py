@@ -5,9 +5,9 @@ from langchain_groq import ChatGroq
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.runnables import RunnablePassthrough
 
 # --- Configuration ---
 PDF_PATH = "my_module.pdf"
@@ -15,20 +15,9 @@ VECTORSTORE_PATH = "faiss_index"
 TOP_K_RETRIEVAL = 5
 TOP_N_RERANK = 1
 
-# --- Prompt Template (Using LangChain's ChatPromptTemplate) ---
-system_prompt = """You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT provided.
-- Do not use any external knowledge or make assumptions.
-- If the CONTEXT contains a list that answers the question, reproduce that list exactly.
-- If the CONTEXT does not contain the answer, you must state only: "The document does not contain the answer to this question."
-"""
-human_prompt = "CONTEXT:\n{context}\n\nQUESTION:\n{question}"
-
 # --- Core Functions ---
 
-# === THE FIX IS HERE ===
-# The @st.cache_data decorator has been REMOVED from this function.
 def create_vectorstore_if_needed():
-    """Creates the vector store if it doesn't already exist."""
     if not os.path.exists(VECTORSTORE_PATH):
         with st.spinner("First-time setup: Processing PDF into a vector store..."):
             doc = fitz.open(PDF_PATH)
@@ -45,7 +34,6 @@ def create_vectorstore_if_needed():
 
 @st.cache_resource
 def load_resources(groq_api_key):
-    """Loads all necessary models and the vector store."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vectorstore = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
     retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K_RETRIEVAL})
@@ -63,12 +51,10 @@ def main():
     st.title("AI Assistant for the PM Module")
     st.info("Powered by Groq Llama 3 for lightning-fast answers.")
 
-    # Check for API Key
     if "GROQ_API_KEY" not in st.secrets or not st.secrets["GROQ_API_KEY"]:
         st.error("GROQ_API_KEY not found in Streamlit Secrets. Please add it to run the app.")
         st.stop()
 
-    # This function is now safe to call here.
     create_vectorstore_if_needed()
 
     try:
@@ -78,11 +64,41 @@ def main():
         st.error(f"Failed to load resources: {e}")
         return
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", human_prompt),
-    ])
-    rag_chain = prompt | llm | StrOutputParser()
+    # === THE FIX IS HERE: A much simpler and more direct chain ===
+    # This chain manually constructs the final prompt without complex templates.
+    def format_docs(docs):
+        return "\n\n---\n\n".join(doc.page_content for doc in docs)
+
+    def get_context_and_rerank(question):
+        initial_docs = retriever.invoke(question)
+        if not initial_docs:
+            return ""
+        
+        query_doc_pairs = [[question, doc.page_content] for doc in initial_docs]
+        scores = reranker_model.score(query_doc_pairs)
+        reranked_results = sorted(zip(scores, initial_docs), key=lambda x: x[0], reverse=True)
+        
+        final_docs = [doc for score, doc in reranked_results[:TOP_N_RERANK]]
+        return format_docs(final_docs)
+
+    system_prompt = """You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT provided.
+- Do not use any external knowledge or make assumptions.
+- If the CONTEXT contains a list that answers the question, reproduce that list exactly.
+- If the CONTEXT does not contain the answer, you must state only: "The document does not contain the answer to this question."
+"""
+
+    # Manually construct the prompt that will be sent to the LLM
+    rag_chain = (
+        RunnablePassthrough.assign(context=lambda x: get_context_and_rerank(x["question"]))
+        | (lambda x: {
+            "messages": [
+                ("system", system_prompt),
+                ("human", f"CONTEXT:\n{x['context']}\n\nQUESTION:\n{x['question']}")
+            ]
+        })
+        | llm
+        | StrOutputParser()
+    )
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -98,25 +114,9 @@ def main():
 
         with st.chat_message("assistant"):
             with st.spinner("Searching document and generating answer..."):
-                initial_docs = retriever.invoke(user_question)
-                if not initial_docs:
-                    st.write("I couldn't find any relevant information.")
-                    st.session_state.messages.append({"role": "assistant", "content": "I couldn't find any relevant information."})
-                    st.stop()
-
-                query_doc_pairs = [[user_question, doc.page_content] for doc in initial_docs]
-                scores = reranker_model.score(query_doc_pairs)
-                reranked_results = sorted(zip(scores, initial_docs), key=lambda x: x[0], reverse=True)
-                
-                final_doc = reranked_results[0][1]
-                context_text = final_doc.page_content
-
-                response = rag_chain.stream({"context": context_text, "question": user_question})
+                response = rag_chain.stream({"question": user_question})
                 generative_answer = st.write_stream(response)
                 
-                with st.expander("Show Source Used"):
-                    st.write(context_text)
-
         st.session_state.messages.append({"role": "assistant", "content": generative_answer})
 
 if __name__ == '__main__':
