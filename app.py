@@ -4,40 +4,30 @@ import fitz  # PyMuPDF
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain_community.llms import CTransformers
-from langchain_core.prompts import PromptTemplate
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- Configuration ---
-# These files must be in your GitHub repository
 PDF_PATH = "my_module.pdf"
-MODEL_PATH = "mistral-7b-instruct-v0.2.Q4_0.gguf" 
-VECTORSTORE_PATH = "faiss_index" # This will be created automatically
+VECTORSTORE_PATH = "faiss_index"
 
 TOP_K_RETRIEVAL = 5
 TOP_N_RERANK = 1
 
-# --- Strict Prompt Template ---
-prompt_template = """
-### INSTRUCTION:
-You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT below.
+# --- Prompt Template for Llama 3 (used by Groq) ---
+system_prompt = """
+You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT provided.
 - Do not use any external knowledge.
 - If the CONTEXT contains a list that answers the question, reproduce that list exactly.
 - If the CONTEXT does not contain the answer, you must state only: "The document does not contain the answer to this question."
-
-### CONTEXT:
-{context}
-
-### QUESTION:
-{question}
-
-### RESPONSE:
 """
+
+human_prompt = "CONTEXT:\n{context}\n\nQUESTION:\n{question}"
 
 # --- Core Functions ---
 
-# This function combines the logic from your "CREATE THE VECTORSTORE" cells
 def create_vectorstore_if_needed():
     """Creates the vector store if it doesn't already exist in the deployment environment."""
     if not os.path.exists(VECTORSTORE_PATH):
@@ -57,41 +47,48 @@ def create_vectorstore_if_needed():
             vectorstore.save_local(VECTORSTORE_PATH)
         st.success("Vector store created! The app is now ready.")
 
-# This function is from your "RUN THE APP" cell's script
 @st.cache_resource
 def load_resources():
-    """Loads all necessary models and the vector store."""
+    """Loads the retrieval components and the Groq LLM."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vectorstore = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
     retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K_RETRIEVAL})
     reranker_model = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
 
-    llm = CTransformers(
-        model=MODEL_PATH,
-        model_type='mistral',
-        config={'max_new_tokens': 2048, 'temperature': 0.1, 'context_length': 4096}
-        # NOTE: gpu_layers is removed because Streamlit Community Cloud uses CPU.
+    # Load the Groq LLM, using the API key from Streamlit's secrets
+    llm = ChatGroq(
+        model_name="llama3-8b-8192",
+        groq_api_key=st.secrets["GROQ_API_KEY"]
     )
     return retriever, reranker_model, llm
 
-# --- Main App Logic (from your app_script_content) ---
-def main():
-    st.set_page_config(page_title="PDF AI Assistant")
-    st.title("AI Assistant for the PM Module")
-    st.info("This assistant answers questions based on the 'Progiciels et Management' course material.")
+# --- Main App Logic ---
 
-    # Run the vector store creation at startup if needed
+def main():
+    st.set_page_config(page_title="PDF AI Assistant", page_icon="🚀")
+    st.title("AI Assistant (Groq API)")
+    st.info("This assistant uses the high-speed Groq API to provide answers.")
+
     create_vectorstore_if_needed()
+
+    # Check for API Key in secrets
+    if "GROQ_API_KEY" not in st.secrets:
+        st.error("GROQ_API_KEY not found in Streamlit Secrets. Please add it to deploy the app.")
+        st.stop()
 
     try:
         retriever, reranker_model, llm = load_resources()
     except Exception as e:
-        st.error(f"Failed to load resources. Are the PDF and model files in the repository? Error: {e}")
+        st.error(f"An error occurred while loading resources: {e}")
         return
 
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", human_prompt),
+    ])
     rag_chain = prompt | llm | StrOutputParser()
 
+    # (The rest of the Streamlit UI logic is the same)
     if "messages" not in st.session_state:
         st.session_state.messages = []
     
@@ -105,7 +102,7 @@ def main():
             st.markdown(user_question)
 
         with st.chat_message("assistant"):
-            with st.spinner("Searching and generating answer... (This may be slow on CPU)"):
+            with st.spinner("Searching document and generating answer..."):
                 initial_docs = retriever.invoke(user_question)
                 generative_answer = ""
                 if initial_docs:
