@@ -5,7 +5,7 @@ from langchain_groq import ChatGroq
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain_core.prompts import ChatPromptTemplate # Use ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -15,25 +15,20 @@ VECTORSTORE_PATH = "faiss_index"
 TOP_K_RETRIEVAL = 5
 TOP_N_RERANK = 1
 
-# === THE FIX IS HERE ===
-# We define the prompt using a structured format that LangChain understands,
-# instead of a raw string with special tokens.
+# --- Prompt Template (Using LangChain's ChatPromptTemplate) ---
 system_prompt = """You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT provided.
 - Do not use any external knowledge or make assumptions.
 - If the CONTEXT contains a list that answers the question, reproduce that list exactly.
 - If the CONTEXT does not contain the answer, you must state only: "The document does not contain the answer to this question."
 """
-
-human_prompt = """CONTEXT:
-{context}
-
-QUESTION:
-{question}"""
+human_prompt = "CONTEXT:\n{context}\n\nQUESTION:\n{question}"
 
 # --- Core Functions ---
 
-@st.cache_data # Using @st.cache_data is better for non-resource-intensive setup
+# === THE FIX IS HERE ===
+# The @st.cache_data decorator has been REMOVED from this function.
 def create_vectorstore_if_needed():
+    """Creates the vector store if it doesn't already exist."""
     if not os.path.exists(VECTORSTORE_PATH):
         with st.spinner("First-time setup: Processing PDF into a vector store..."):
             doc = fitz.open(PDF_PATH)
@@ -50,6 +45,7 @@ def create_vectorstore_if_needed():
 
 @st.cache_resource
 def load_resources(groq_api_key):
+    """Loads all necessary models and the vector store."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vectorstore = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
     retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K_RETRIEVAL})
@@ -67,26 +63,25 @@ def main():
     st.title("AI Assistant for the PM Module")
     st.info("Powered by Groq Llama 3 for lightning-fast answers.")
 
-    create_vectorstore_if_needed()
-
+    # Check for API Key
     if "GROQ_API_KEY" not in st.secrets or not st.secrets["GROQ_API_KEY"]:
         st.error("GROQ_API_KEY not found in Streamlit Secrets. Please add it to run the app.")
         st.stop()
+
+    # This function is now safe to call here.
+    create_vectorstore_if_needed()
 
     try:
         api_key = st.secrets["GROQ_API_KEY"]
         retriever, reranker_model, llm = load_resources(groq_api_key=api_key)
     except Exception as e:
-        st.error(f"An error occurred while loading resources: {e}")
+        st.error(f"Failed to load resources: {e}")
         return
 
-    # === AND THE FIX IS HERE ===
-    # Create the prompt from a list of (role, template) tuples
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("human", human_prompt),
     ])
-    
     rag_chain = prompt | llm | StrOutputParser()
 
     if "messages" not in st.session_state:
@@ -106,6 +101,7 @@ def main():
                 initial_docs = retriever.invoke(user_question)
                 if not initial_docs:
                     st.write("I couldn't find any relevant information.")
+                    st.session_state.messages.append({"role": "assistant", "content": "I couldn't find any relevant information."})
                     st.stop()
 
                 query_doc_pairs = [[user_question, doc.page_content] for doc in initial_docs]
