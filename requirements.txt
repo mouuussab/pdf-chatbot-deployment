@@ -1,0 +1,8 @@
+streamlit
+langchain
+langchain-community
+langchain-core
+ctransformers>=0.2.27
+sentence-transformers
+faiss-cpu
+pymupdf
