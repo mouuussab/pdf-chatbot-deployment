@@ -1,90 +1,91 @@
 import streamlit as st
 import os
-import fitz
-from langchain_groq import ChatGroq
+import fitz  # PyMuPDF
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain_core.prompts import PromptTemplate
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- Configuration ---
 PDF_PATH = "my_module.pdf"
 VECTORSTORE_PATH = "faiss_index"
+TOP_K_RETRIEVAL = 5
+TOP_N_RERANK = 1
 
-# --- Prompt Template (Optimized for Llama 3 on Groq) ---
-prompt_template_str = """
-<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT below.
-- Do not use any external knowledge or make assumptions.
+# --- Prompt Template for Llama 3 (used by Groq) ---
+system_prompt = """
+You are a text extraction robot. Your only function is to answer the user's question using ONLY the information found in the CONTEXT provided.
+- Do not use any external knowledge.
 - If the CONTEXT contains a list that answers the question, reproduce that list exactly.
-- If the CONTEXT does not contain the answer, you must state only: "The document does not contain the answer to this question."<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-CONTEXT:
-{context}
-
-QUESTION:
-{question}<|eot_id|>
-
-<|start_header_id|>assistant<|end_header_id|>
+- If the CONTEXT does not contain the answer, you must state only: "The document does not contain the answer to this question."
 """
+human_prompt = "CONTEXT:\n{context}\n\nQUESTION:\n{question}"
 
 # --- Core Functions ---
 
-@st.cache_resource
 def create_vectorstore_if_needed():
-    """Creates the vector store if it doesn't already exist."""
     if not os.path.exists(VECTORSTORE_PATH):
-        with st.spinner("First-time setup: Processing PDF into a vector store..."):
+        st.write("First-time setup: Creating the vector store from the PDF...")
+        with st.spinner("Processing PDF, this may take a moment..."):
             doc = fitz.open(PDF_PATH)
             raw_text = "".join([page.get_text() for page in doc])
             doc.close()
             
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1200, chunk_overlap=200, length_function=len
+            )
             chunks = text_splitter.split_text(raw_text)
             
             embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             vectorstore = FAISS.from_texts(texts=chunks, embedding=embeddings)
             vectorstore.save_local(VECTORSTORE_PATH)
-        st.toast("Vector store created successfully!")
+        st.success("Vector store created! The app is now ready.")
 
+# === THE FIX IS HERE ===
 @st.cache_resource
-def load_resources():
-    """Loads all necessary models and the vector store."""
-    create_vectorstore_if_needed()
-    
+def load_resources(groq_api_key): # Pass the key in as an argument
+    """Loads the retrieval components and the Groq LLM."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vectorstore = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K_RETRIEVAL})
     reranker_model = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
 
-    # Load the Groq LLM, pulling the API key from Streamlit secrets
+    # Use the API key that was passed into the function
     llm = ChatGroq(
-        groq_api_key=st.secrets["GROQ_API_KEY"],
-        model_name="llama3-8b-8192"
+        model_name="llama3-8b-8192",
+        groq_api_key=groq_api_key 
     )
     return retriever, reranker_model, llm
 
 # --- Main App Logic ---
-def main():
-    st.set_page_config(page_title="PDF AI Assistant", page_icon="🤖")
-    st.title("AI Assistant for the PM Module")
-    st.info("Powered by Groq Llama 3 for lightning-fast answers.")
 
-    # Check for API Key
-    if "GROQ_API_KEY" not in st.secrets:
-        st.error("GROQ_API_KEY not found in Streamlit secrets. Please add it to run the app.")
+def main():
+    st.set_page_config(page_title="PDF AI Assistant", page_icon="🚀")
+    st.title("AI Assistant (Groq API)")
+    st.info("This assistant uses the high-speed Groq API to provide answers.")
+
+    create_vectorstore_if_needed()
+
+    if "GROQ_API_KEY" not in st.secrets or not st.secrets["GROQ_API_KEY"]:
+        st.error("GROQ_API_KEY not found in Streamlit Secrets. Please add it to deploy the app.")
         st.stop()
 
     try:
-        retriever, reranker_model, llm = load_resources()
+        # === AND THE FIX IS HERE ===
+        # Read the secret *outside* the cached function and pass it in
+        api_key = st.secrets["GROQ_API_KEY"]
+        retriever, reranker_model, llm = load_resources(groq_api_key=api_key)
     except Exception as e:
-        st.error(f"Failed to load resources: {e}")
+        st.error(f"An error occurred while loading resources: {e}")
         return
 
-    prompt = PromptTemplate.from_template(prompt_template_str)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", human_prompt),
+    ])
     rag_chain = prompt | llm | StrOutputParser()
 
     if "messages" not in st.session_state:
@@ -102,22 +103,23 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("Searching document and generating answer..."):
                 initial_docs = retriever.invoke(user_question)
-                if not initial_docs:
-                    st.write("I couldn't find any relevant information.")
-                    st.stop()
+                generative_answer = ""
+                if initial_docs:
+                    query_doc_pairs = [[user_question, doc.page_content] for doc in initial_docs]
+                    scores = reranker_model.score(query_doc_pairs)
+                    reranked_results = sorted(zip(scores, initial_docs), key=lambda x: x[0], reverse=True)
+                    
+                    final_docs = [doc for score, doc in reranked_results[:TOP_N_RERANK]]
+                    context_text = "\\n\\n---\\n\\n".join([doc.page_content for doc in final_docs])
 
-                query_doc_pairs = [[user_question, doc.page_content] for doc in initial_docs]
-                scores = reranker_model.score(query_doc_pairs)
-                reranked_results = sorted(zip(scores, initial_docs), key=lambda x: x[0], reverse=True)
-                
-                final_doc = reranked_results[0][1]
-                context_text = final_doc.page_content
-
-                response = rag_chain.stream({"context": context_text, "question": user_question})
-                generative_answer = st.write_stream(response)
-                
-                with st.expander("Show Source Used"):
-                    st.write(context_text)
+                    response = rag_chain.stream({"context": context_text, "question": user_question})
+                    generative_answer = st.write_stream(response)
+                    
+                    with st.expander("Show Source Used"):
+                        st.write(final_docs[0].page_content)
+                else:
+                    generative_answer = "I couldn't find any relevant information."
+                    st.markdown(generative_answer)
 
         st.session_state.messages.append({"role": "assistant", "content": generative_answer})
 
